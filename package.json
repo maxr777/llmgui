@@ -1,7 +1,7 @@
 {
   "name": "llmgui",
   "private": true,
-  "version": "0.2.0",
+  "version": "2026.7.19-1",
   "type": "module",
   "packageManager": "pnpm@9.15.9",
   "scripts": {

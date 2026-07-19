@@ -41,6 +41,13 @@ struct ChatResponse {
     stop_reason: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialTestRequest {
+    provider: String,
+    api_key: String,
+}
+
 struct HttpClient(Client);
 
 fn validate(request: &ChatRequest) -> Result<(), String> {
@@ -220,8 +227,10 @@ async fn send_json(request: RequestBuilder) -> Result<Value, String> {
 }
 
 fn status_error(status: StatusCode, message: Option<&str>) -> String {
+    if matches!(status.as_u16(), 401 | 403) {
+        return "Authentication failed. Check the API key and its permissions.".into();
+    }
     let category = match status.as_u16() {
-        401 | 403 => "Authentication failed",
         404 => "Model or endpoint not found",
         429 => "Provider rate limit reached",
         400..=499 => "Provider rejected the request",
@@ -494,6 +503,37 @@ async fn google(client: &Client, request: &ChatRequest) -> Result<ChatResponse, 
     })
 }
 
+fn credential_test_request(
+    client: &Client,
+    request: &CredentialTestRequest,
+) -> Result<RequestBuilder, String> {
+    if request.api_key.trim().is_empty() {
+        return Err("An API key is required.".into());
+    }
+    match request.provider.as_str() {
+        "openai" => Ok(client
+            .get("https://api.openai.com/v1/models")
+            .bearer_auth(&request.api_key)),
+        "anthropic" => Ok(client
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", &request.api_key)
+            .header("anthropic-version", "2023-06-01")),
+        "google" => Ok(client
+            .get("https://generativelanguage.googleapis.com/v1beta/models")
+            .header("x-goog-api-key", &request.api_key)),
+        _ => Err("Unsupported provider.".into()),
+    }
+}
+
+#[tauri::command]
+async fn test_credentials(
+    client: State<'_, HttpClient>,
+    request: CredentialTestRequest,
+) -> Result<(), String> {
+    let request = credential_test_request(&client.0, &request)?;
+    send_json(request).await.map(|_| ())
+}
+
 #[tauri::command]
 async fn chat(client: State<'_, HttpClient>, request: ChatRequest) -> Result<ChatResponse, String> {
     validate(&request)?;
@@ -518,7 +558,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(HttpClient(client))
-        .invoke_handler(tauri::generate_handler![chat])
+        .invoke_handler(tauri::generate_handler![chat, test_credentials])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -549,6 +589,70 @@ mod tests {
         assert!(validate(&request("openai")).is_ok());
         assert!(validate(&request("anthropic")).is_ok());
         assert!(validate(&request("google")).is_ok());
+    }
+
+    #[test]
+    fn builds_fixed_provider_credential_tests() {
+        let client = Client::new();
+        let cases = [
+            (
+                "openai",
+                "https://api.openai.com/v1/models",
+                "authorization",
+            ),
+            (
+                "anthropic",
+                "https://api.anthropic.com/v1/models",
+                "x-api-key",
+            ),
+            (
+                "google",
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "x-goog-api-key",
+            ),
+        ];
+        for (provider, url, header) in cases {
+            let request = credential_test_request(
+                &client,
+                &CredentialTestRequest {
+                    provider: provider.into(),
+                    api_key: "test-key".into(),
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            assert_eq!(request.url().as_str(), url);
+            assert!(request.headers().contains_key(header));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_credential_tests() {
+        let client = Client::new();
+        for (provider, api_key) in [("unknown", "test-key"), ("openai", "  ")] {
+            assert!(credential_test_request(
+                &client,
+                &CredentialTestRequest {
+                    provider: provider.into(),
+                    api_key: api_key.into(),
+                },
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn redacts_provider_authentication_errors() {
+        let error = status_error(
+            StatusCode::UNAUTHORIZED,
+            Some("Incorrect API key provided: sk-secret-fingerprint"),
+        );
+        assert_eq!(
+            error,
+            "Authentication failed. Check the API key and its permissions."
+        );
+        assert!(!error.contains("sk-secret-fingerprint"));
     }
 
     #[test]

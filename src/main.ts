@@ -365,6 +365,43 @@ function updatePendingUi() {
   ($("#send-btn") as HTMLButtonElement).disabled = pending;
 }
 
+async function testCredentials(provider: Provider, button: HTMLButtonElement) {
+  const keyInput = $(`#key-${provider}`) as HTMLInputElement;
+  const status = $(`#test-status-${provider}`) as HTMLSpanElement;
+  const apiKey = keyInput.value.trim();
+  status.className = "provider-test-status";
+  status.textContent = "";
+  status.title = "";
+  if (!apiKey) {
+    status.classList.add("failure");
+    status.textContent = "×";
+    status.title = "Enter an API key first.";
+    status.setAttribute("aria-label", status.title);
+    keyInput.focus();
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = "Testing…";
+  try {
+    await invoke("test_credentials", { request: { provider, apiKey } });
+    if (keyInput.value.trim() !== apiKey) return;
+    status.classList.add("success");
+    status.textContent = "✓";
+    status.title = "API key accepted for model listing. Chat access may still depend on model permissions and billing.";
+  } catch (error) {
+    if (keyInput.value.trim() !== apiKey) return;
+    status.classList.add("failure");
+    status.textContent = "×";
+    status.title = String(error);
+  } finally {
+    if (status.title) status.setAttribute("aria-label", status.title);
+    else status.removeAttribute("aria-label");
+    button.disabled = false;
+    button.textContent = "Test";
+  }
+}
+
 async function sendMessage() {
   const input = $("#chat-input") as HTMLTextAreaElement;
   const text = input.value.trim();
@@ -483,12 +520,22 @@ async function addAttachments(files: FileList | null) {
 function bindSettings() {
   for (const provider of providers) {
     const models = $(`#models-${provider}`) as HTMLInputElement;
+    const key = $(`#key-${provider}`) as HTMLInputElement;
+    const test = $(`.provider-test[data-provider="${provider}"]`) as HTMLButtonElement;
+    const testStatus = $(`#test-status-${provider}`) as HTMLSpanElement;
     models.value = state.models[provider];
     models.addEventListener("input", () => {
       state.models[provider] = models.value;
       updateModels();
       saveState();
     });
+    key.addEventListener("input", () => {
+      testStatus.className = "provider-test-status";
+      testStatus.textContent = "";
+      testStatus.title = "";
+      testStatus.removeAttribute("aria-label");
+    });
+    test.addEventListener("click", () => void testCredentials(provider, test));
   }
   const fields: [string, keyof Pick<AppState, "temperature" | "topP" | "topK" | "thinking">][] = [
     ["#setting-temp", "temperature"],

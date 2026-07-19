@@ -69,12 +69,12 @@ const providers: Provider[] = ["openai", "anthropic", "google"];
 const defaultState: AppState = {
   version: 2,
   selectedProvider: "openai",
-  selectedModel: "gpt-4.1",
+  selectedModel: "gpt-5.6-terra",
   selectedPromptId: "default",
   models: {
-    openai: "gpt-4.1,gpt-4.1-mini",
-    anthropic: "claude-sonnet-4-5,claude-haiku-4-5",
-    google: "gemini-2.5-pro,gemini-2.5-flash",
+    openai: "gpt-5.6-terra,gpt-5.6-luna",
+    anthropic: "claude-sonnet-5,claude-haiku-4-5",
+    google: "gemini-3.5-flash,gemini-3.1-flash-lite",
   },
   prompts: [
     { id: "default", name: "Default Assistant", content: "You are a helpful assistant." },

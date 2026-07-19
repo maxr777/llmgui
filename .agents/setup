@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Installing Tauri system dependencies..."
+sudo apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+  libwebkit2gtk-4.1-dev \
+  libappindicator3-dev \
+  librsvg2-dev \
+  patchelf
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "Installing Rust..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --component rustfmt
+  source "$HOME/.cargo/env"
+fi
+
+rustup component add rustfmt
+
+echo "Installing frontend dependencies..."
+corepack pnpm@9.15.9 install --frozen-lockfile

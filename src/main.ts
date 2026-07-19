@@ -1,366 +1,584 @@
 import { invoke } from "@tauri-apps/api/core";
+import DOMPurify from "dompurify";
+import hljs from "highlight.js/lib/common";
+import "highlight.js/styles/github-dark.min.css";
+import "katex/dist/katex.min.css";
+import renderMathInElement from "katex/contrib/auto-render";
+import { marked } from "marked";
 
-// Define Global types for the external libraries
-declare const marked: any;
-declare const renderMathInElement: any;
-declare const hljs: any;
+type Provider = "openai" | "anthropic" | "google";
+type Role = "user" | "assistant";
 
-let chatInputEl: HTMLTextAreaElement | null;
-let chatFeedEl: HTMLElement | null;
-let chatFormEl: HTMLFormElement | null;
-let sendBtnEl: HTMLButtonElement | null;
-let statusTokensEl: HTMLElement | null;
-let statusModelNameEl: HTMLElement | null;
-let settingModelSelectEl: HTMLSelectElement | null;
-let historyListEl: HTMLElement | null;
+interface Attachment {
+  name: string;
+  content: string;
+}
 
-// UI Panels
-let historyPanel: HTMLElement | null;
-let settingsOverlay: HTMLElement | null;
+interface Message {
+  role: Role;
+  content: string;
+  attachments?: Attachment[];
+}
 
-// System Prompt Management
-let promptSelectEl: HTMLSelectElement | null;
-let promptNameEl: HTMLInputElement | null;
-let promptSystemEl: HTMLTextAreaElement | null;
+interface Conversation {
+  id: string;
+  title: string;
+  starred: boolean;
+  updatedAt: number;
+  messages: Message[];
+}
 
-let systemPrompts = [
-  { id: "default", name: "Default Assistant", content: "You are a helpful assistant." },
-  { id: "coding", name: "Coding Partner", content: "You are an expert software engineer. Provide concise, high-quality code." }
-];
+interface SystemPrompt {
+  id: string;
+  name: string;
+  content: string;
+}
 
-function updatePromptDropdown() {
-  if (!promptSelectEl) return;
-  const currentId = promptSelectEl.value;
-  promptSelectEl.innerHTML = "";
-  
-  // Permanent None option
-  const noneOpt = document.createElement("option");
-  noneOpt.value = "none";
-  noneOpt.textContent = "None (Disabled)";
-  promptSelectEl.appendChild(noneOpt);
+interface AppState {
+  version: 2;
+  selectedProvider: Provider;
+  selectedModel: string;
+  selectedPromptId: string;
+  models: Record<Provider, string>;
+  prompts: SystemPrompt[];
+  conversations: Conversation[];
+  activeConversationId: string | null;
+  temperature: string;
+  topP: string;
+  topK: string;
+}
 
-  systemPrompts.forEach(p => {
-    const opt = document.createElement("option");
-    opt.value = p.id;
-    opt.textContent = p.name;
-    promptSelectEl?.appendChild(opt);
-  });
+interface ChatResponse {
+  content: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  stopReason?: string;
+}
 
-  const newOpt = document.createElement("option");
-  newOpt.value = "new";
-  newOpt.textContent = "+ Add New";
-  promptSelectEl.appendChild(newOpt);
-  
-  if (currentId) promptSelectEl.value = currentId;
+const STORAGE_KEY = "llmgui-state-v2";
+const providers: Provider[] = ["openai", "anthropic", "google"];
+const defaultState: AppState = {
+  version: 2,
+  selectedProvider: "openai",
+  selectedModel: "gpt-4.1",
+  selectedPromptId: "default",
+  models: {
+    openai: "gpt-4.1,gpt-4.1-mini",
+    anthropic: "claude-sonnet-4-5,claude-haiku-4-5",
+    google: "gemini-2.5-pro,gemini-2.5-flash",
+  },
+  prompts: [
+    { id: "default", name: "Default Assistant", content: "You are a helpful assistant." },
+    { id: "coding", name: "Coding Partner", content: "You are an expert software engineer. Provide concise, high-quality code." },
+  ],
+  conversations: [],
+  activeConversationId: null,
+  temperature: "",
+  topP: "",
+  topK: "",
+};
+
+let state = loadState();
+let pendingAttachments: Attachment[] = [];
+const pendingConversations = new Set<string>();
+
+const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector);
+
+function loadState(): AppState {
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null") as Partial<AppState> | null;
+    if (!saved || saved.version !== 2 || !saved.models || !Array.isArray(saved.prompts) || !Array.isArray(saved.conversations)) {
+      return structuredClone(defaultState);
+    }
+    return { ...structuredClone(defaultState), ...saved, models: { ...defaultState.models, ...saved.models } };
+  } catch {
+    return structuredClone(defaultState);
+  }
+}
+
+function saveState(): boolean {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    return true;
+  } catch {
+    showError("Could not save locally. The app's storage may be full.");
+    return false;
+  }
+}
+
+function activeConversation(): Conversation | undefined {
+  return state.conversations.find((conversation) => conversation.id === state.activeConversationId);
+}
+
+function apiContent(message: Message): string {
+  if (!message.attachments?.length) return message.content;
+  const files = message.attachments.map((file) =>
+    `\n\n<attachment name="${file.name.replace(/"/g, "&quot;")}">\n${file.content}\n</attachment>`,
+  ).join("");
+  return message.content + files;
+}
+
+function parseOptionalNumber(value: string): number | undefined {
+  if (!value.trim()) return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function updateModels() {
+  const select = $("#setting-model-select") as HTMLSelectElement;
+  const previous = `${state.selectedProvider}:${state.selectedModel}`;
+  select.replaceChildren();
+  for (const provider of providers) {
+    const models = state.models[provider].split(",").map((model) => model.trim()).filter(Boolean);
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = `${provider}:${model}`;
+      option.textContent = model;
+      option.dataset.provider = provider;
+      option.dataset.model = model;
+      select.append(option);
+    }
+  }
+  const matching = Array.from(select.options).find((option) => option.value === previous);
+  if (matching) select.value = matching.value;
+  else if (select.options.length) {
+    const option = select.options[0];
+    state.selectedProvider = option.dataset.provider as Provider;
+    state.selectedModel = option.dataset.model || "";
+  }
+  updateStatus();
+}
+
+function updatePromptDropdown(preferred = state.selectedPromptId) {
+  const select = $("#setting-prompt-select") as HTMLSelectElement;
+  select.replaceChildren(new Option("None (Disabled)", "none"));
+  for (const prompt of state.prompts) select.append(new Option(prompt.name, prompt.id));
+  select.append(new Option("+ Add New", "new"));
+  select.value = Array.from(select.options).some((option) => option.value === preferred) ? preferred : "none";
+  loadSelectedPrompt();
 }
 
 function loadSelectedPrompt() {
-  if (!promptSelectEl || !promptNameEl || !promptSystemEl) return;
-  const id = promptSelectEl.value;
-  const deleteBtn = document.querySelector("#btn-prompt-delete") as HTMLButtonElement;
-  const saveBtn = document.querySelector("#btn-prompt-save") as HTMLButtonElement;
-  const statusPromptEl = document.querySelector("#status-prompt-name");
+  const select = $("#setting-prompt-select") as HTMLSelectElement;
+  const name = $("#setting-prompt-name") as HTMLInputElement;
+  const content = $("#setting-system") as HTMLTextAreaElement;
+  const save = $("#btn-prompt-save") as HTMLButtonElement;
+  const remove = $("#btn-prompt-delete") as HTMLButtonElement;
+  const prompt = state.prompts.find((item) => item.id === select.value);
 
-  if (id === "new") {
-    promptNameEl.value = "";
-    promptSystemEl.value = "";
-    promptNameEl.disabled = false;
-    promptSystemEl.disabled = false;
-    if (deleteBtn) deleteBtn.style.display = "none";
-    if (saveBtn) saveBtn.style.display = "block";
-    if (statusPromptEl) statusPromptEl.textContent = "new";
-  } else if (id === "none") {
-    promptNameEl.value = "Disabled";
-    promptSystemEl.value = "";
-    promptNameEl.disabled = true;
-    promptSystemEl.disabled = true;
-    if (deleteBtn) deleteBtn.style.display = "none";
-    if (saveBtn) saveBtn.style.display = "none";
-    if (statusPromptEl) statusPromptEl.textContent = "none";
+  if (select.value === "new") {
+    name.value = "";
+    content.value = "";
+  } else if (prompt) {
+    name.value = prompt.name;
+    content.value = prompt.content;
+    state.selectedPromptId = prompt.id;
+    saveState();
   } else {
-    const p = systemPrompts.find(x => x.id === id);
-    if (p) {
-      promptNameEl.value = p.name;
-      promptSystemEl.value = p.content;
-      promptNameEl.disabled = false;
-      promptSystemEl.disabled = false;
-      if (deleteBtn) deleteBtn.style.display = "block";
-      if (saveBtn) saveBtn.style.display = "block";
-      if (statusPromptEl) statusPromptEl.textContent = p.name.toLowerCase();
-    }
+    name.value = "Disabled";
+    content.value = "";
+    state.selectedPromptId = "none";
+    saveState();
   }
+  const disabled = select.value === "none";
+  name.disabled = disabled;
+  content.disabled = disabled;
+  save.style.display = disabled ? "none" : "block";
+  remove.style.display = prompt ? "block" : "none";
+  updateStatus();
 }
 
-// Mock history data
-let historyData = [
-  { id: 1, title: "Current Conversation", active: true, starred: false },
-  { id: 2, title: "Project Architecture Ideas", active: false, starred: true },
-  { id: 3, title: "Rust Backend Implementation", active: false, starred: false },
-  { id: 4, title: "Minimalist CSS Tricks", active: false, starred: true }
-];
+function updateStatus(tokens?: number) {
+  $("#status-model-name")!.textContent = state.selectedModel || "none";
+  const prompt = state.prompts.find((item) => item.id === state.selectedPromptId);
+  $("#status-prompt-name")!.textContent = prompt?.name.toLowerCase() || "none";
+  if (tokens !== undefined) $("#status-tokens")!.textContent = String(tokens);
+}
 
-function createHistoryItem(item: any) {
-  const div = document.createElement("div");
-  div.className = `history-item ${item.active ? 'active' : ''}`;
-  div.innerHTML = `
-    <span class="history-title">${item.title}</span>
-    <div class="history-actions">
-      <button class="history-action-btn star ${item.starred ? 'active' : ''}" title="${item.starred ? 'Unstar' : 'Star'}">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="${item.starred ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-      </button>
-      <button class="history-action-btn rename" title="Rename">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"/></svg>
-      </button>
-      <button class="history-action-btn delete" title="Delete">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
-      </button>
-    </div>
-  `;
-  div.addEventListener("click", () => {
-    historyData.forEach(h => h.active = (h.id === item.id));
+function createIconButton(className: string, title: string, svg: string): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.className = `history-action-btn ${className}`;
+  button.title = title;
+  button.type = "button";
+  button.innerHTML = svg;
+  return button;
+}
+
+function createHistoryItem(conversation: Conversation): HTMLElement {
+  const item = document.createElement("div");
+  item.className = `history-item ${conversation.id === state.activeConversationId ? "active" : ""}`;
+  const title = document.createElement("span");
+  title.className = "history-title";
+  title.textContent = conversation.title;
+  const actions = document.createElement("div");
+  actions.className = "history-actions";
+  const star = createIconButton(
+    `star ${conversation.starred ? "active" : ""}`,
+    conversation.starred ? "Unstar" : "Star",
+    `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="${conversation.starred ? "currentColor" : "none"}" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
+  );
+  const rename = createIconButton("rename", "Rename", `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"/></svg>`);
+  const remove = createIconButton("delete", "Delete", `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 1 1 1 2v2"/></svg>`);
+  actions.append(star, rename, remove);
+  item.append(title, actions);
+
+  item.addEventListener("click", () => selectConversation(conversation.id));
+  star.addEventListener("click", (event) => {
+    event.stopPropagation();
+    conversation.starred = !conversation.starred;
+    saveState();
     renderHistory();
   });
-  div.querySelector(".star")?.addEventListener("click", (e) => {
-    e.stopPropagation();
-    item.starred = !item.starred;
-    renderHistory();
-  });
-  div.querySelector(".rename")?.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const newTitle = prompt("Rename to:", item.title);
-    if (newTitle) { item.title = newTitle; renderHistory(); }
-  });
-  div.querySelector(".delete")?.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (confirm("Delete this chat?")) {
-      historyData = historyData.filter(h => h.id !== item.id);
+  rename.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const next = window.prompt("Rename to:", conversation.title)?.trim();
+    if (next) {
+      conversation.title = next.slice(0, 100);
+      saveState();
       renderHistory();
     }
   });
-  return div;
+  remove.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (!window.confirm("Delete this chat?")) return;
+    state.conversations = state.conversations.filter((item) => item.id !== conversation.id);
+    if (state.activeConversationId === conversation.id) {
+      state.activeConversationId = null;
+      clearComposer();
+    }
+    saveState();
+    renderHistory();
+    renderConversation();
+  });
+  return item;
 }
 
 function renderHistory() {
-  if (!historyListEl) return;
-  historyListEl.innerHTML = "";
-  const starred = historyData.filter(h => h.starred);
-  const recent = historyData.filter(h => !h.starred);
-  if (starred.length > 0) {
+  const list = $("#history-list")!;
+  list.replaceChildren();
+  const sorted = [...state.conversations].sort((a, b) => b.updatedAt - a.updatedAt);
+  const sections: [string, Conversation[]][] = [
+    ["Starred", sorted.filter((item) => item.starred)],
+    ["Recent", sorted.filter((item) => !item.starred)],
+  ];
+  let first = true;
+  for (const [label, conversations] of sections) {
+    if (!conversations.length) continue;
     const header = document.createElement("div");
-    header.className = "history-section-header first";
-    header.textContent = "Starred";
-    historyListEl.appendChild(header);
-    starred.forEach(item => historyListEl?.appendChild(createHistoryItem(item)));
-  }
-  if (recent.length > 0) {
-    const header = document.createElement("div");
-    header.className = `history-section-header ${starred.length === 0 ? 'first' : ''}`;
-    header.textContent = "Recent";
-    historyListEl.appendChild(header);
-    recent.forEach(item => historyListEl?.appendChild(createHistoryItem(item)));
+    header.className = `history-section-header ${first ? "first" : ""}`;
+    header.textContent = label;
+    list.append(header, ...conversations.map(createHistoryItem));
+    first = false;
   }
 }
 
-function updateTokenCount(tokens: number) {
-  if (statusTokensEl) statusTokensEl.textContent = `${tokens}`;
-}
-
-function updateModelDropdown() {
-  if (!settingModelSelectEl) return;
-  const currentModel = settingModelSelectEl.value;
-  settingModelSelectEl.innerHTML = "";
-  ["openai", "anthropic", "google"].forEach(provider => {
-    const input = document.querySelector(`#models-${provider}`) as HTMLInputElement;
-    if (input && input.value) {
-      input.value.split(",").forEach(model => {
-        const m = model.trim();
-        if (m) {
-          const option = document.createElement("option");
-          option.value = m;
-          option.textContent = m;
-          settingModelSelectEl?.appendChild(option);
-        }
-      });
-    }
+function renderAssistantContent(element: HTMLElement, content: string) {
+  const rendered = marked.parse(content, { async: false }) as string;
+  element.innerHTML = DOMPurify.sanitize(rendered, {
+    FORBID_TAGS: ["form", "iframe", "object", "embed", "style", "img"],
+    FORBID_ATTR: ["style"],
   });
-  if (currentModel && Array.from(settingModelSelectEl.options).some(o => o.value === currentModel)) {
-    settingModelSelectEl.value = currentModel;
-  }
-  updateStatusModelName();
-}
-
-function updateStatusModelName() {
-  if (statusModelNameEl && settingModelSelectEl) {
-    statusModelNameEl.textContent = settingModelSelectEl.value || "none";
-  }
-}
-
-function renderContent(content: string): string {
-  marked.setOptions({
-    highlight: function(code: string, lang: string) {
-      if (lang && hljs.getLanguage(lang)) return hljs.highlight(code, { language: lang }).value;
-      return hljs.highlightAuto(code).value;
-    }
+  renderMathInElement(element, {
+    delimiters: [
+      { left: "$$", right: "$$", display: true },
+      { left: "$", right: "$", display: false },
+    ],
+    throwOnError: false,
   });
-  return marked.parse(content);
+  element.querySelectorAll<HTMLElement>("pre code").forEach((block) => hljs.highlightElement(block));
+  element.querySelectorAll<HTMLAnchorElement>("a").forEach((link) => {
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+  });
 }
 
-function appendMessage(role: "user" | "ai", content: string) {
-  if (!chatFeedEl) return;
-  const messageDiv = document.createElement("div");
-  messageDiv.className = `message ${role}`;
-  const contentDiv = document.createElement("div");
-  contentDiv.className = "message-content";
-  if (role === "ai") {
-    contentDiv.innerHTML = renderContent(content);
-    setTimeout(() => {
-      renderMathInElement(contentDiv, {
-        delimiters: [{left: '$$', right: '$$', display: true}, {left: '$', right: '$', display: false}],
-        throwOnError : false
-      });
-      contentDiv.querySelectorAll('pre code').forEach((block: any) => hljs.highlightElement(block));
-    }, 0);
-  } else {
-    contentDiv.textContent = content;
+function messageElement(message: Message): HTMLElement {
+  const wrapper = document.createElement("div");
+  wrapper.className = `message ${message.role === "assistant" ? "ai" : "user"}`;
+  const content = document.createElement("div");
+  content.className = "message-content";
+  if (message.role === "assistant") renderAssistantContent(content, message.content);
+  else content.textContent = message.content;
+  wrapper.append(content);
+  if (message.attachments?.length) {
+    const attachments = document.createElement("div");
+    attachments.className = "message-attachments";
+    attachments.textContent = message.attachments.map((file) => file.name).join(", ");
+    wrapper.append(attachments);
   }
-  messageDiv.appendChild(contentDiv);
-  chatFeedEl.appendChild(messageDiv);
-  chatFeedEl.scrollTop = chatFeedEl.scrollHeight;
+  return wrapper;
+}
+
+function renderConversation() {
+  const feed = $("#chat-feed")!;
+  const conversation = activeConversation();
+  feed.replaceChildren(...(conversation?.messages.map(messageElement) || []));
+  feed.scrollTop = feed.scrollHeight;
+  updatePendingUi();
+}
+
+function selectConversation(id: string) {
+  if (state.activeConversationId !== id) clearComposer();
+  state.activeConversationId = id;
+  saveState();
+  renderHistory();
+  renderConversation();
+  $("#history-panel")?.classList.remove("open");
+}
+
+function newConversation() {
+  state.activeConversationId = null;
+  clearComposer();
+  saveState();
+  renderHistory();
+  renderConversation();
+  renderPendingAttachments();
+  $("#history-panel")?.classList.remove("open");
+  ($("#chat-input") as HTMLTextAreaElement).focus();
+}
+
+function clearComposer() {
+  const input = $("#chat-input") as HTMLTextAreaElement | null;
+  if (input) {
+    input.value = "";
+    input.style.height = "26px";
+  }
+  pendingAttachments = [];
+  if ($("#attachment-list")) renderPendingAttachments();
+}
+
+function showError(message: string) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "message ai error";
+  const content = document.createElement("div");
+  content.className = "message-content";
+  content.textContent = message;
+  wrapper.append(content);
+  $("#chat-feed")?.append(wrapper);
+}
+
+function updatePendingUi() {
+  const pending = state.activeConversationId ? pendingConversations.has(state.activeConversationId) : false;
+  ($("#send-btn") as HTMLButtonElement).disabled = pending;
 }
 
 async function sendMessage() {
-  if (!chatInputEl || !chatInputEl.value.trim() || !sendBtnEl) return;
-  const prompt = chatInputEl.value.trim();
-  appendMessage("user", prompt);
-  updateTokenCount(Math.ceil(prompt.length / 4));
-  chatInputEl.value = "";
-  chatInputEl.style.height = "26px";
-  sendBtnEl.disabled = true;
+  const input = $("#chat-input") as HTMLTextAreaElement;
+  const text = input.value.trim();
+  if (!text || !state.selectedModel) return;
+  const key = ($(`#key-${state.selectedProvider}`) as HTMLInputElement).value.trim();
+  if (!key) {
+    $("#settings-overlay")?.classList.add("open");
+    ($(`#key-${state.selectedProvider}`) as HTMLInputElement).focus();
+    showError(`Enter an ${state.selectedProvider} API key in Settings.`);
+    return;
+  }
+
+  let conversation = activeConversation();
+  if (!conversation) {
+    conversation = {
+      id: crypto.randomUUID(),
+      title: text.replace(/\s+/g, " ").slice(0, 55),
+      starred: false,
+      updatedAt: Date.now(),
+      messages: [],
+    };
+    state.conversations.unshift(conversation);
+    state.activeConversationId = conversation.id;
+  }
+  if (pendingConversations.has(conversation.id)) return;
+
+  const userMessage: Message = {
+    role: "user",
+    content: text,
+    attachments: pendingAttachments.length ? pendingAttachments : undefined,
+  };
+  conversation.messages.push(userMessage);
+  conversation.updatedAt = Date.now();
+  const conversationId = conversation.id;
+  const messages = conversation.messages.map((message) => ({ role: message.role, content: apiContent(message) }));
+  const system = state.prompts.find((prompt) => prompt.id === state.selectedPromptId)?.content;
+  pendingConversations.add(conversationId);
+  pendingAttachments = [];
+  input.value = "";
+  input.style.height = "26px";
+  saveState();
+  renderPendingAttachments();
+  renderHistory();
+  renderConversation();
+
   try {
-    const response: string = await invoke("chat", { prompt });
-    appendMessage("ai", response);
-    updateTokenCount(Math.ceil((prompt.length + response.length) / 4));
+    const response = await invoke<ChatResponse>("chat", {
+      request: {
+        provider: state.selectedProvider,
+        model: state.selectedModel,
+        apiKey: key,
+        system,
+        messages,
+        temperature: parseOptionalNumber(state.temperature),
+        topP: parseOptionalNumber(state.topP),
+        topK: parseOptionalNumber(state.topK),
+      },
+    });
+    const target = state.conversations.find((item) => item.id === conversationId);
+    if (target) {
+      target.messages.push({ role: "assistant", content: response.content });
+      target.updatedAt = Date.now();
+      saveState();
+      renderHistory();
+      if (state.activeConversationId === conversationId) {
+        renderConversation();
+        updateStatus(response.totalTokens ?? ((response.inputTokens || 0) + (response.outputTokens || 0)));
+      }
+    }
   } catch (error) {
-    appendMessage("ai", "Error: Failed to get response.");
+    if (state.activeConversationId === conversationId) showError(String(error));
   } finally {
-    sendBtnEl.disabled = false;
+    pendingConversations.delete(conversationId);
+    updatePendingUi();
   }
 }
 
-window.addEventListener("DOMContentLoaded", () => {
-  chatInputEl = document.querySelector("#chat-input");
-  chatFeedEl = document.querySelector("#chat-feed");
-  chatFormEl = document.querySelector("#chat-form");
-  sendBtnEl = document.querySelector("#send-btn");
-  statusTokensEl = document.querySelector("#status-tokens");
-  statusModelNameEl = document.querySelector("#status-model-name");
-  settingModelSelectEl = document.querySelector("#setting-model-select");
-  historyListEl = document.querySelector("#history-list");
-  historyPanel = document.querySelector("#history-panel");
-  settingsOverlay = document.querySelector("#settings-overlay");
-  
-  promptSelectEl = document.querySelector("#setting-prompt-select");
-  promptNameEl = document.querySelector("#setting-prompt-name");
-  promptSystemEl = document.querySelector("#setting-system");
+function renderPendingAttachments() {
+  const list = $("#attachment-list")!;
+  list.replaceChildren();
+  for (const [index, file] of pendingAttachments.entries()) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "attachment-chip";
+    item.title = "Remove attachment";
+    item.textContent = `${file.name} ×`;
+    item.addEventListener("click", () => {
+      pendingAttachments.splice(index, 1);
+      renderPendingAttachments();
+    });
+    list.append(item);
+  }
+}
 
-  updateModelDropdown();
-  updatePromptDropdown();
-  loadSelectedPrompt();
-  renderHistory();
-
-  chatFormEl?.addEventListener("submit", (e) => { e.preventDefault(); sendMessage(); });
-
-  chatInputEl?.addEventListener("input", () => {
-    if (chatInputEl && chatFormEl) {
-      chatInputEl.style.height = "26px";
-      const newHeight = chatInputEl.scrollHeight;
-      chatInputEl.style.height = (newHeight > 26 ? newHeight : 26) + "px";
-      chatFormEl.classList.toggle("multi-line", newHeight > 26);
+async function addAttachments(files: FileList | null) {
+  if (!files) return;
+  let aggregate = pendingAttachments.reduce((total, file) => total + new TextEncoder().encode(file.content).length, 0);
+  for (const file of Array.from(files)) {
+    if (file.size > 256 * 1024) {
+      showError(`${file.name} is larger than the 256 KiB attachment limit.`);
+      continue;
     }
+    const content = await file.text();
+    const bytes = new TextEncoder().encode(content).length;
+    if (content.includes("\0") || aggregate + bytes > 512 * 1024) {
+      showError(`${file.name} is not a text file or exceeds the 512 KiB total limit.`);
+      continue;
+    }
+    pendingAttachments.push({ name: file.name.slice(0, 255), content });
+    aggregate += bytes;
+  }
+  renderPendingAttachments();
+}
+
+function bindSettings() {
+  for (const provider of providers) {
+    const models = $(`#models-${provider}`) as HTMLInputElement;
+    models.value = state.models[provider];
+    models.addEventListener("input", () => {
+      state.models[provider] = models.value;
+      updateModels();
+      saveState();
+    });
+  }
+  const fields: [string, keyof Pick<AppState, "temperature" | "topP" | "topK">][] = [
+    ["#setting-temp", "temperature"],
+    ["#setting-topp", "topP"],
+    ["#setting-topk", "topK"],
+  ];
+  for (const [selector, property] of fields) {
+    const input = $(selector) as HTMLInputElement;
+    input.value = state[property];
+    input.addEventListener("change", () => {
+      state[property] = input.value;
+      saveState();
+    });
+  }
+  const modelSelect = $("#setting-model-select") as HTMLSelectElement;
+  modelSelect.addEventListener("change", () => {
+    const option = modelSelect.selectedOptions[0];
+    state.selectedProvider = option.dataset.provider as Provider;
+    state.selectedModel = option.dataset.model || "";
+    saveState();
+    updateStatus();
   });
-
-  chatInputEl?.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-  });
-
-  document.querySelector("#history-btn")?.addEventListener("click", (e) => {
-    e.stopPropagation();
-    historyPanel?.classList.toggle("open");
-  });
-
-  document.querySelector("#settings-btn")?.addEventListener("click", () => settingsOverlay?.classList.add("open"));
-
-  document.querySelector("#new-chat-btn-main")?.addEventListener("click", () => {
-    if (chatFeedEl) chatFeedEl.innerHTML = "";
-    historyPanel?.classList.remove("open");
-  });
-
-  ["openai", "anthropic", "google"].forEach(provider => {
-    document.querySelector(`#models-${provider}`)?.addEventListener("input", updateModelDropdown);
-  });
-
-  settingModelSelectEl?.addEventListener("change", updateStatusModelName);
-  
-  // Prompt Actions
-  promptSelectEl?.addEventListener("change", loadSelectedPrompt);
-  
-  document.querySelector("#btn-prompt-save")?.addEventListener("click", () => {
-    const id = promptSelectEl?.value;
-    const name = promptNameEl?.value || "Untitled";
-    const content = promptSystemEl?.value || "";
-    if (id === "new" || id === "none") {
-      const newId = Date.now().toString();
-      systemPrompts.push({ id: newId, name, content });
-      updatePromptDropdown();
-      if (promptSelectEl) promptSelectEl.value = newId;
-      loadSelectedPrompt();
+  $("#setting-prompt-select")?.addEventListener("change", loadSelectedPrompt);
+  $("#btn-prompt-save")?.addEventListener("click", () => {
+    const select = $("#setting-prompt-select") as HTMLSelectElement;
+    const name = ($("#setting-prompt-name") as HTMLInputElement).value.trim() || "Untitled";
+    const content = ($("#setting-system") as HTMLTextAreaElement).value;
+    let id = select.value;
+    if (id === "new") {
+      id = crypto.randomUUID();
+      state.prompts.push({ id, name, content });
     } else {
-      const p = systemPrompts.find(x => x.id === id);
-      if (p) { p.name = name; p.content = content; updatePromptDropdown(); }
+      const prompt = state.prompts.find((item) => item.id === id);
+      if (prompt) Object.assign(prompt, { name, content });
+    }
+    state.selectedPromptId = id;
+    saveState();
+    updatePromptDropdown(id);
+  });
+  $("#btn-prompt-delete")?.addEventListener("click", () => {
+    const select = $("#setting-prompt-select") as HTMLSelectElement;
+    state.prompts = state.prompts.filter((prompt) => prompt.id !== select.value);
+    state.selectedPromptId = "none";
+    saveState();
+    updatePromptDropdown("none");
+  });
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  bindSettings();
+  updateModels();
+  updatePromptDropdown();
+  renderHistory();
+  renderConversation();
+
+  $("#chat-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendMessage();
+  });
+  const input = $("#chat-input") as HTMLTextAreaElement;
+  input.addEventListener("input", () => {
+    input.style.height = "26px";
+    input.style.height = `${Math.max(26, input.scrollHeight)}px`;
+    $("#chat-form")?.classList.toggle("multi-line", input.scrollHeight > 26);
+  });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void sendMessage();
     }
   });
-
-  document.querySelector("#btn-prompt-delete")?.addEventListener("click", () => {
-    const id = promptSelectEl?.value;
-    if (id && id !== "new" && id !== "none") {
-      systemPrompts = systemPrompts.filter(x => x.id !== id);
-      updatePromptDropdown();
-      if (promptSelectEl) {
-        promptSelectEl.value = "none";
-      }
-      loadSelectedPrompt();
-    }
+  $("#history-btn")?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    $("#history-panel")?.classList.toggle("open");
   });
-
-  // Toggle API Keys
-  document.querySelectorAll(".toggle-key").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const targetId = btn.getAttribute("data-target");
-      const input = document.getElementById(targetId!) as HTMLInputElement;
-      if (input.type === "password") {
-        input.type = "text";
-        btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.52 13.52 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><line x1="2" y1="2" x2="22" y2="22"/></svg>`;
-      } else {
-        input.type = "password";
-        btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="eye-icon"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0z"/><circle cx="12" cy="12" r="3"/></svg>`;
-      }
+  $("#settings-btn")?.addEventListener("click", () => $("#settings-overlay")?.classList.add("open"));
+  $("#new-chat-btn-main")?.addEventListener("click", newConversation);
+  $("#attach-btn")?.addEventListener("click", () => ($("#attachment-input") as HTMLInputElement).click());
+  $("#attachment-input")?.addEventListener("change", async (event) => {
+    const fileInput = event.target as HTMLInputElement;
+    await addAttachments(fileInput.files);
+    fileInput.value = "";
+  });
+  document.querySelectorAll<HTMLButtonElement>(".toggle-key").forEach((button) => {
+    button.addEventListener("click", () => {
+      const input = document.getElementById(button.dataset.target!) as HTMLInputElement;
+      input.type = input.type === "password" ? "text" : "password";
     });
   });
-
-  // Cap number inputs to 1 decimal place
-  document.querySelectorAll('input[type="number"]').forEach(input => {
-    input.addEventListener("blur", (e) => {
-      const target = e.target as HTMLInputElement;
-      if (target.id === "setting-temp" || target.id === "setting-topp") {
-        const val = parseFloat(target.value);
-        if (!isNaN(val)) { target.value = val.toFixed(1); }
-      }
-    });
-  });
-
-  document.addEventListener("click", (e) => {
-    const target = e.target as HTMLElement;
-    if (historyPanel?.classList.contains("open") && !historyPanel.contains(target)) historyPanel.classList.remove("open");
-    if (target === settingsOverlay) settingsOverlay?.classList.remove("open");
+  document.addEventListener("click", (event) => {
+    const target = event.target as Node;
+    const history = $("#history-panel");
+    if (history?.classList.contains("open") && !history.contains(target)) history.classList.remove("open");
+    if (target === $("#settings-overlay")) $("#settings-overlay")?.classList.remove("open");
   });
 });

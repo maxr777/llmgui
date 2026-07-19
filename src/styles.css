@@ -382,6 +382,7 @@ input:focus, select:focus, textarea:focus { border-color: #444; }
 
 .message.user { align-items: flex-end; }
 .message.ai { align-items: flex-start; }
+.message.error .message-content { color: #d97878; }
 
 .message-content {
   max-width: 95%;
@@ -419,6 +420,12 @@ input:focus, select:focus, textarea:focus { border-color: #444; }
 
 .ai .message-content { color: #ccc; padding: 10px 0; }
 
+.message-attachments {
+  margin-top: 4px;
+  color: #666;
+  font-size: 0.75rem;
+}
+
 .input-area {
   position: fixed;
   bottom: 0;
@@ -439,6 +446,30 @@ input:focus, select:focus, textarea:focus { border-color: #444; }
   align-items: center;
   pointer-events: all;
 }
+
+.attachment-list {
+  width: 90%;
+  max-width: 700px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.attachment-list:empty { display: none; }
+
+.attachment-chip {
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 7px;
+  color: #777;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 4px 8px;
+}
+
+.attachment-chip:hover { color: #aaa; border-color: #444; }
 
 .input-container {
   width: 90%;

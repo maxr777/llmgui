@@ -14,3 +14,30 @@ This project is deliberately small and self-contained. The goal is a tight, no-b
 - **Tauri + Vanilla TS.** The frontend stays plain TypeScript and HTML/CSS. No UI framework, no state library, no build-time magic beyond what's already here.
 
 When in doubt, leave it out.
+
+## Architecture and Security
+
+- `src/main.ts` owns UI state, local conversation persistence, prompt management, and attachment handling.
+- `src-tauri/src/lib.rs` owns provider HTTP requests. Keep provider endpoints fixed in Rust; never accept arbitrary endpoint URLs from the WebView.
+- API keys are session-only. Never write them to local storage, logs, errors, or conversation history.
+- Treat model output as untrusted. Keep Markdown sanitization and the restrictive Tauri CSP intact.
+- Keep provider request formats explicit rather than forcing OpenAI, Anthropic, and Google through a misleading shared wire format.
+
+## Verification
+
+Run the narrow checks relevant to the change. Before a release, run all of:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm build
+cargo fmt --check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+## Releases
+
+- Keep versions synchronized in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`.
+- Tags use `vX.Y.Z` and must match the application version exactly.
+- Pushing a version tag triggers `.github/workflows/release.yml`, which builds a draft GitHub release for Linux x64, Windows x64, and both macOS architectures.
+- Publish the draft only after every matrix job succeeds and all installers are attached.
+- Release installers are currently unsigned. Do not imply they are signed or notarized unless signing credentials and configuration are added.

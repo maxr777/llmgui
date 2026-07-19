@@ -1,9 +1,11 @@
+use keyring::{Entry, Error as KeyringError};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::time::Duration;
 use tauri::State;
 
+const CREDENTIAL_SERVICE: &str = "com.maxr777.llmgui";
 const MAX_MESSAGES: usize = 200;
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
@@ -22,6 +24,7 @@ struct ChatMessage {
 struct ChatRequest {
     provider: String,
     model: String,
+    #[serde(skip)]
     api_key: String,
     system: Option<String>,
     messages: Vec<ChatMessage>,
@@ -45,10 +48,89 @@ struct ChatResponse {
 #[serde(rename_all = "camelCase")]
 struct CredentialTestRequest {
     provider: String,
+    #[serde(skip)]
     api_key: String,
 }
 
+#[derive(Serialize)]
+struct ApiKeyStatus {
+    saved: bool,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ApiKeyStatuses {
+    openai: ApiKeyStatus,
+    anthropic: ApiKeyStatus,
+    google: ApiKeyStatus,
+}
+
 struct HttpClient(Client);
+
+fn credential_entry(provider: &str) -> Result<Entry, String> {
+    if !matches!(provider, "openai" | "anthropic" | "google") {
+        return Err("Unsupported provider.".into());
+    }
+    Entry::new(CREDENTIAL_SERVICE, provider)
+        .map_err(|_| "Could not access the system credential store.".into())
+}
+
+fn load_api_key_from_store(provider: &str) -> Result<String, String> {
+    match credential_entry(provider)?.get_password() {
+        Ok(key) => Ok(key),
+        Err(KeyringError::NoEntry) => Err("An API key is required.".into()),
+        Err(_) => Err("Could not read from the system credential store.".into()),
+    }
+}
+
+fn api_key_status(provider: &str) -> ApiKeyStatus {
+    let entry = match credential_entry(provider) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return ApiKeyStatus {
+                saved: false,
+                error: Some(error),
+            }
+        }
+    };
+    match entry.get_password() {
+        Ok(_) => ApiKeyStatus {
+            saved: true,
+            error: None,
+        },
+        Err(KeyringError::NoEntry) => ApiKeyStatus {
+            saved: false,
+            error: None,
+        },
+        Err(_) => ApiKeyStatus {
+            saved: false,
+            error: Some("Could not read from the system credential store.".into()),
+        },
+    }
+}
+
+fn load_api_key_statuses_from_store() -> ApiKeyStatuses {
+    ApiKeyStatuses {
+        openai: api_key_status("openai"),
+        anthropic: api_key_status("anthropic"),
+        google: api_key_status("google"),
+    }
+}
+
+fn save_api_key_to_store(provider: &str, api_key: &str) -> Result<(), String> {
+    let entry = credential_entry(provider)?;
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        match entry.delete_credential() {
+            Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(_) => Err("Could not delete from the system credential store.".into()),
+        }
+    } else {
+        entry
+            .set_password(api_key)
+            .map_err(|_| "Could not save to the system credential store.".into())
+    }
+}
 
 fn validate(request: &ChatRequest) -> Result<(), String> {
     if request.api_key.trim().is_empty() {
@@ -525,17 +607,43 @@ fn credential_test_request(
     }
 }
 
+async fn stored_api_key(provider: &str) -> Result<String, String> {
+    let provider = provider.to_string();
+    tauri::async_runtime::spawn_blocking(move || load_api_key_from_store(&provider))
+        .await
+        .map_err(|_| "Could not access the system credential store.".to_string())?
+}
+
+#[tauri::command]
+async fn load_api_key_statuses() -> Result<ApiKeyStatuses, String> {
+    tauri::async_runtime::spawn_blocking(load_api_key_statuses_from_store)
+        .await
+        .map_err(|_| "Could not access the system credential store.".to_string())
+}
+
+#[tauri::command]
+async fn save_api_key(provider: String, api_key: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_api_key_to_store(&provider, &api_key))
+        .await
+        .map_err(|_| "Could not access the system credential store.".to_string())?
+}
+
 #[tauri::command]
 async fn test_credentials(
     client: State<'_, HttpClient>,
-    request: CredentialTestRequest,
+    mut request: CredentialTestRequest,
 ) -> Result<(), String> {
+    request.api_key = stored_api_key(&request.provider).await?;
     let request = credential_test_request(&client.0, &request)?;
     send_json(request).await.map(|_| ())
 }
 
 #[tauri::command]
-async fn chat(client: State<'_, HttpClient>, request: ChatRequest) -> Result<ChatResponse, String> {
+async fn chat(
+    client: State<'_, HttpClient>,
+    mut request: ChatRequest,
+) -> Result<ChatResponse, String> {
+    request.api_key = stored_api_key(&request.provider).await?;
     validate(&request)?;
     match request.provider.as_str() {
         "openai" => openai(&client.0, &request).await,
@@ -558,7 +666,12 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(HttpClient(client))
-        .invoke_handler(tauri::generate_handler![chat, test_credentials])
+        .invoke_handler(tauri::generate_handler![
+            chat,
+            load_api_key_statuses,
+            save_api_key,
+            test_credentials
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -589,6 +702,24 @@ mod tests {
         assert!(validate(&request("openai")).is_ok());
         assert!(validate(&request("anthropic")).is_ok());
         assert!(validate(&request("google")).is_ok());
+    }
+
+    #[test]
+    fn ignores_api_keys_from_the_webview() {
+        let chat: ChatRequest = serde_json::from_value(json!({
+            "provider": "openai",
+            "model": "test-model",
+            "apiKey": "webview-key",
+            "messages": [{ "role": "user", "content": "Hello" }]
+        }))
+        .unwrap();
+        let test: CredentialTestRequest = serde_json::from_value(json!({
+            "provider": "openai",
+            "apiKey": "webview-key"
+        }))
+        .unwrap();
+        assert!(chat.api_key.is_empty());
+        assert!(test.api_key.is_empty());
     }
 
     #[test]

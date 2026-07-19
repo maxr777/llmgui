@@ -57,6 +57,13 @@ interface ChatResponse {
   stopReason?: string;
 }
 
+interface ApiKeyStatus {
+  saved: boolean;
+  error?: string;
+}
+
+type ApiKeyStatuses = Record<Provider, ApiKeyStatus>;
+
 const STORAGE_KEY = "llmgui-state-v2";
 const providers: Provider[] = ["openai", "anthropic", "google"];
 const defaultState: AppState = {
@@ -84,6 +91,14 @@ const defaultState: AppState = {
 let state = loadState();
 let pendingAttachments: Attachment[] = [];
 const pendingConversations = new Set<string>();
+const apiKeySaved: Record<Provider, boolean> = { openai: false, anthropic: false, google: false };
+const apiKeyRevisions: Record<Provider, number> = { openai: 0, anthropic: 0, google: 0 };
+const apiKeySaveChains: Record<Provider, Promise<void>> = {
+  openai: Promise.resolve(),
+  anthropic: Promise.resolve(),
+  google: Promise.resolve(),
+};
+let apiKeysLoaded: Promise<void> = Promise.resolve();
 
 const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector);
 
@@ -369,28 +384,31 @@ async function testCredentials(provider: Provider, button: HTMLButtonElement) {
   const keyInput = $(`#key-${provider}`) as HTMLInputElement;
   const status = $(`#test-status-${provider}`) as HTMLSpanElement;
   const apiKey = keyInput.value.trim();
+  const revision = apiKeyRevisions[provider];
   status.className = "provider-test-status";
   status.textContent = "";
   status.title = "";
-  if (!apiKey) {
-    status.classList.add("failure");
-    status.textContent = "×";
-    status.title = "Enter an API key first.";
-    status.setAttribute("aria-label", status.title);
-    keyInput.focus();
-    return;
-  }
 
   button.disabled = true;
   button.textContent = "Testing…";
   try {
-    await invoke("test_credentials", { request: { provider, apiKey } });
-    if (keyInput.value.trim() !== apiKey) return;
+    if (apiKey) await saveEnteredApiKey(provider);
+    else await apiKeySaveChains[provider];
+    if (apiKeyRevisions[provider] !== revision) return;
+    if (!apiKeySaved[provider]) {
+      status.classList.add("failure");
+      status.textContent = "×";
+      status.title = "Enter an API key first.";
+      keyInput.focus();
+      return;
+    }
+    await invoke("test_credentials", { request: { provider } });
+    if (apiKeyRevisions[provider] !== revision) return;
     status.classList.add("success");
     status.textContent = "✓";
-    status.title = "API key accepted for model listing. Chat access may still depend on model permissions and billing.";
+    status.title = "Saved API key accepted for model listing. Chat access may still depend on model permissions and billing.";
   } catch (error) {
-    if (keyInput.value.trim() !== apiKey) return;
+    if (apiKeyRevisions[provider] !== revision) return;
     status.classList.add("failure");
     status.textContent = "×";
     status.title = String(error);
@@ -402,15 +420,109 @@ async function testCredentials(provider: Provider, button: HTMLButtonElement) {
   }
 }
 
+function updateApiKeyUi(provider: Provider, status: ApiKeyStatus) {
+  const input = $(`#key-${provider}`) as HTMLInputElement;
+  const indicator = $(`#test-status-${provider}`) as HTMLSpanElement;
+  apiKeySaved[provider] = status.saved;
+  input.placeholder = status.saved ? "Saved securely — enter replacement" : "API Key (saved securely)";
+  if (status.error) {
+    indicator.className = "provider-test-status failure";
+    indicator.textContent = "×";
+    indicator.title = status.error;
+    indicator.setAttribute("aria-label", status.error);
+  }
+}
+
+async function loadApiKeyStatuses() {
+  try {
+    const revisions = { ...apiKeyRevisions };
+    const statuses = await invoke<ApiKeyStatuses>("load_api_key_statuses");
+    for (const provider of providers) {
+      if (apiKeyRevisions[provider] === revisions[provider]) updateApiKeyUi(provider, statuses[provider]);
+    }
+  } catch (error) {
+    for (const provider of providers) {
+      const status = $(`#test-status-${provider}`) as HTMLSpanElement;
+      status.classList.add("failure");
+      status.textContent = "×";
+      status.title = String(error);
+      status.setAttribute("aria-label", status.title);
+    }
+  }
+}
+
+function saveEnteredApiKey(provider: Provider): Promise<void> {
+  const input = $(`#key-${provider}`) as HTMLInputElement;
+  const apiKey = input.value.trim();
+  if (!apiKey) return apiKeySaveChains[provider];
+  return queueApiKeySave(provider, apiKey, true);
+}
+
+function queueApiKeySave(provider: Provider, apiKey: string, saved: boolean): Promise<void> {
+  const revision = apiKeyRevisions[provider];
+  const input = $(`#key-${provider}`) as HTMLInputElement;
+  const status = $(`#test-status-${provider}`) as HTMLSpanElement;
+  const save = apiKeySaveChains[provider]
+    .catch(() => undefined)
+    .then(() => invoke("save_api_key", { provider, apiKey }))
+    .then(() => {
+      apiKeySaved[provider] = saved;
+      if (apiKeyRevisions[provider] !== revision) return;
+      input.value = "";
+      updateApiKeyUi(provider, { saved });
+      status.className = "provider-test-status success";
+      status.textContent = "✓";
+      status.title = saved ? "API key saved securely." : "Saved API key deleted.";
+      status.setAttribute("aria-label", status.title);
+    })
+    .catch((error) => {
+      if (apiKeyRevisions[provider] === revision) {
+        status.className = "provider-test-status failure";
+        status.textContent = "×";
+        status.title = String(error);
+        status.setAttribute("aria-label", status.title);
+      }
+      throw error;
+    });
+  apiKeySaveChains[provider] = save;
+  return save;
+}
+
+async function saveVisibleApiKeys(): Promise<boolean> {
+  providers
+    .filter((provider) => ($(`#key-${provider}`) as HTMLInputElement).value.trim())
+    .forEach((provider) => void saveEnteredApiKey(provider));
+  try {
+    await Promise.all(providers.map((provider) => apiKeySaveChains[provider]));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function sendMessage() {
   const input = $("#chat-input") as HTMLTextAreaElement;
   const text = input.value.trim();
   if (!text || !state.selectedModel) return;
-  const key = ($(`#key-${state.selectedProvider}`) as HTMLInputElement).value.trim();
-  if (!key) {
+  const provider = state.selectedProvider;
+  const model = state.selectedModel;
+  await apiKeysLoaded;
+  if (($(`#key-${provider}`) as HTMLInputElement).value.trim()) {
+    try {
+      await saveEnteredApiKey(provider);
+    } catch {
+      return;
+    }
+  }
+  try {
+    await apiKeySaveChains[provider];
+  } catch {
+    return;
+  }
+  if (!apiKeySaved[provider]) {
     $("#settings-overlay")?.classList.add("open");
-    ($(`#key-${state.selectedProvider}`) as HTMLInputElement).focus();
-    showError(`Enter ${state.selectedProvider} API key in Settings.`);
+    ($(`#key-${provider}`) as HTMLInputElement).focus();
+    showError(`Enter ${provider} API key in Settings.`);
     return;
   }
 
@@ -450,9 +562,8 @@ async function sendMessage() {
   try {
     const response = await invoke<ChatResponse>("chat", {
       request: {
-        provider: state.selectedProvider,
-        model: state.selectedModel,
-        apiKey: key,
+        provider,
+        model,
         system,
         messages,
         temperature: parseOptionalNumber(state.temperature),
@@ -522,6 +633,8 @@ function bindSettings() {
     const models = $(`#models-${provider}`) as HTMLInputElement;
     const key = $(`#key-${provider}`) as HTMLInputElement;
     const test = $(`.provider-test[data-provider="${provider}"]`) as HTMLButtonElement;
+    const save = $(`.provider-save[data-provider="${provider}"]`) as HTMLButtonElement;
+    const clear = $(`.provider-clear[data-provider="${provider}"]`) as HTMLButtonElement;
     const testStatus = $(`#test-status-${provider}`) as HTMLSpanElement;
     models.value = state.models[provider];
     models.addEventListener("input", () => {
@@ -530,10 +643,17 @@ function bindSettings() {
       saveState();
     });
     key.addEventListener("input", () => {
+      apiKeyRevisions[provider]++;
       testStatus.className = "provider-test-status";
       testStatus.textContent = "";
       testStatus.title = "";
       testStatus.removeAttribute("aria-label");
+    });
+    save.addEventListener("click", () => void saveEnteredApiKey(provider).catch(() => undefined));
+    clear.addEventListener("click", () => {
+      apiKeyRevisions[provider]++;
+      key.value = "";
+      void queueApiKeySave(provider, "", false).catch(() => undefined);
     });
     test.addEventListener("click", () => void testCredentials(provider, test));
   }
@@ -587,6 +707,7 @@ function bindSettings() {
 
 window.addEventListener("DOMContentLoaded", () => {
   bindSettings();
+  apiKeysLoaded = loadApiKeyStatuses();
   updateModels();
   updatePromptDropdown();
   renderHistory();
@@ -626,10 +747,12 @@ window.addEventListener("DOMContentLoaded", () => {
       input.type = input.type === "password" ? "text" : "password";
     });
   });
-  document.addEventListener("click", (event) => {
+  document.addEventListener("click", async (event) => {
     const target = event.target as Node;
     const history = $("#history-panel");
     if (history?.classList.contains("open") && !history.contains(target)) history.classList.remove("open");
-    if (target === $("#settings-overlay")) $("#settings-overlay")?.classList.remove("open");
+    if (target === $("#settings-overlay") && await saveVisibleApiKeys()) {
+      $("#settings-overlay")?.classList.remove("open");
+    }
   });
 });

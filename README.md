@@ -12,7 +12,7 @@ Built entirely with LLMs as an experiment in LLM-assisted development.
 - Text and code attachments (256 KiB per file, 512 KiB per message)
 - Provider-reported token usage and actionable API errors
 
-API keys are sent only from the native Rust process to the selected provider. They are kept in memory for the current app session and are not written to local storage. Conversations and non-secret settings are stored locally in the app's WebView profile.
+API keys are stored in the operating system credential store and are read only by the native Rust process when contacting the selected provider. They are never returned to the WebView or written to local storage or conversation history. Conversations and non-secret settings are stored locally in the app's WebView profile.
 
 ## Download
 
@@ -48,7 +48,7 @@ corepack pnpm@9.15.9 tauri dev
 corepack pnpm@9.15.9 tauri build    # output: src-tauri/target/release/bundle/
 ```
 
-Open **Settings**, enter the key for your provider, choose a model, and close the modal by clicking outside it. Model lists are editable so newer provider model IDs can be used without an app update.
+Open **Settings**, enter the key for your provider, and choose **Save** or click outside the modal. API keys are saved in the operating system credential store. Model lists are editable so newer provider model IDs can be used without an app update.
 
 ## Releasing
 

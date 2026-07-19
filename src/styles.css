@@ -277,7 +277,7 @@ body {
   letter-spacing: 0.15em;
 }
 
-.provider-test {
+.provider-action {
   background: none;
   border: 1px solid #333;
   border-radius: 4px;
@@ -289,12 +289,12 @@ body {
   text-transform: uppercase;
 }
 
-.provider-test:hover:not(:disabled) {
+.provider-action:hover:not(:disabled) {
   border-color: #555;
   color: #aaa;
 }
 
-.provider-test:disabled {
+.provider-action:disabled {
   cursor: wait;
   opacity: 0.6;
 }

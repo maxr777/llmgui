@@ -1,6 +1,6 @@
 [package]
 name = "llmgui"
-version = "2026.7.19-3"
+version = "2026.7.19-4"
 description = "llmgui"
 authors = ["maxr777"]
 edition = "2021"

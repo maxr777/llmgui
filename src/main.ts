@@ -67,6 +67,11 @@ type ApiKeyStatuses = Record<Provider, ApiKeyStatus>;
 
 const STORAGE_KEY = "llmgui-state-v2";
 const providers: Provider[] = ["openai", "anthropic", "google"];
+const previousDefaultModels: Record<Provider, string> = {
+  openai: "gpt-4.1,gpt-4.1-mini",
+  anthropic: "claude-sonnet-4-5,claude-haiku-4-5",
+  google: "gemini-2.5-pro,gemini-2.5-flash",
+};
 const defaultState: AppState = {
   version: 2,
   selectedProvider: "openai",
@@ -109,12 +114,20 @@ function loadState(): AppState {
     if (!saved || saved.version !== 2 || !saved.models || !Array.isArray(saved.prompts) || !Array.isArray(saved.conversations)) {
       return structuredClone(defaultState);
     }
-    return {
+    const loaded = {
       ...structuredClone(defaultState),
       ...saved,
       models: { ...defaultState.models, ...saved.models },
       activeConversationId: null,
     };
+    for (const provider of providers) {
+      if (loaded.models[provider] !== previousDefaultModels[provider]) continue;
+      loaded.models[provider] = defaultState.models[provider];
+      if (loaded.selectedProvider === provider && previousDefaultModels[provider].split(",")[0] === loaded.selectedModel) {
+        loaded.selectedModel = defaultState.models[provider].split(",")[0];
+      }
+    }
+    return loaded;
   } catch {
     return structuredClone(defaultState);
   }
@@ -430,7 +443,7 @@ function updateApiKeyUi(provider: Provider, status: ApiKeyStatus) {
   const input = $(`#key-${provider}`) as HTMLInputElement;
   const indicator = $(`#test-status-${provider}`) as HTMLSpanElement;
   apiKeySaved[provider] = status.saved;
-  input.placeholder = status.saved ? "Saved securely — enter replacement" : "API Key (saved securely)";
+  input.placeholder = status.saved ? "Stored in system credential store — enter replacement" : "API key";
   if (status.error) {
     indicator.className = "provider-test-status failure";
     indicator.textContent = "×";
@@ -478,7 +491,7 @@ function queueApiKeySave(provider: Provider, apiKey: string, saved: boolean): Pr
       updateApiKeyUi(provider, { saved });
       status.className = "provider-test-status success";
       status.textContent = "✓";
-      status.title = saved ? "API key saved securely." : "Saved API key deleted.";
+      status.title = saved ? "API key stored in the system credential store." : "Stored API key deleted.";
       status.setAttribute("aria-label", status.title);
     })
     .catch((error) => {
@@ -526,9 +539,13 @@ async function sendMessage() {
     return;
   }
   if (!apiKeySaved[provider]) {
+    const keyInput = $(`#key-${provider}`) as HTMLInputElement;
+    const keyHelp = $(`#key-help-${provider}`) as HTMLSpanElement;
     $("#settings-overlay")?.classList.add("open");
-    ($(`#key-${provider}`) as HTMLInputElement).focus();
-    showError(`Enter ${provider} API key in Settings.`);
+    keyInput.classList.add("required");
+    keyInput.setAttribute("aria-invalid", "true");
+    keyHelp.textContent = `An API key is required to use ${model}.`;
+    keyInput.focus();
     return;
   }
 
@@ -642,6 +659,7 @@ function bindSettings() {
     const save = $(`.provider-save[data-provider="${provider}"]`) as HTMLButtonElement;
     const clear = $(`.provider-clear[data-provider="${provider}"]`) as HTMLButtonElement;
     const testStatus = $(`#test-status-${provider}`) as HTMLSpanElement;
+    const keyHelp = $(`#key-help-${provider}`) as HTMLSpanElement;
     models.value = state.models[provider];
     models.addEventListener("input", () => {
       state.models[provider] = models.value;
@@ -650,6 +668,9 @@ function bindSettings() {
     });
     key.addEventListener("input", () => {
       apiKeyRevisions[provider]++;
+      key.classList.remove("required");
+      key.removeAttribute("aria-invalid");
+      keyHelp.textContent = "";
       testStatus.className = "provider-test-status";
       testStatus.textContent = "";
       testStatus.title = "";

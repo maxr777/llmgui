@@ -323,6 +323,22 @@ body {
   padding-right: 40px !important;
 }
 
+.key-container input.required {
+  border-color: #b84f59;
+  box-shadow: 0 0 0 2px #b84f5926;
+}
+
+.key-help {
+  display: none;
+  color: #d97878;
+  font-size: 0.72rem;
+  line-height: 1.3;
+}
+
+.key-help:not(:empty) {
+  display: block;
+}
+
 .toggle-key {
   position: absolute;
   right: 8px;

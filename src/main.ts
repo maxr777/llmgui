@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import DOMPurify from "dompurify";
 import hljs from "highlight.js/lib/common";
 import "highlight.js/styles/github-dark.min.css";
@@ -717,6 +718,16 @@ window.addEventListener("DOMContentLoaded", () => {
   updatePromptDropdown();
   renderHistory();
   renderConversation();
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "F11") return;
+    event.preventDefault();
+    if (event.repeat) return;
+    const appWindow = getCurrentWindow();
+    void appWindow.isFullscreen()
+      .then((fullscreen) => appWindow.setFullscreen(!fullscreen))
+      .catch(() => showError("Could not toggle fullscreen."));
+  });
 
   $("#chat-form")?.addEventListener("submit", (event) => {
     event.preventDefault();

@@ -410,7 +410,7 @@ async function sendMessage() {
   if (!key) {
     $("#settings-overlay")?.classList.add("open");
     ($(`#key-${state.selectedProvider}`) as HTMLInputElement).focus();
-    showError(`Enter an ${state.selectedProvider} API key in Settings.`);
+    showError(`Enter ${state.selectedProvider} API key in Settings.`);
     return;
   }
 

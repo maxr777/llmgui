@@ -8,6 +8,7 @@ const MAX_MESSAGES: usize = 200;
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_OUTPUT_TOKENS: u64 = 4096;
+const MAX_THINKING_TOKENS: u64 = 16384;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +28,7 @@ struct ChatRequest {
     temperature: Option<f64>,
     top_p: Option<f64>,
     top_k: Option<u64>,
+    thinking: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -89,8 +91,86 @@ fn validate(request: &ChatRequest) -> Result<(), String> {
             return Err("Top-P must be between 0 and 1.".into());
         }
     }
-    if request.provider == "anthropic" && request.temperature.is_some() && request.top_p.is_some() {
+    let thinking = request.thinking.as_deref().map(str::trim);
+    if request.provider == "anthropic"
+        && thinking.is_none()
+        && request.temperature.is_some()
+        && request.top_p.is_some()
+    {
         return Err("Anthropic accepts either Temperature or Top-P, not both.".into());
+    }
+    if let Some(thinking) = thinking {
+        if thinking.is_empty() || thinking.len() > 20 {
+            return Err("Thinking must be a valid effort or token budget.".into());
+        }
+        match request.provider.as_str() {
+            "openai" => {
+                if !matches!(
+                    thinking,
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                ) {
+                    return Err(
+                        "OpenAI Thinking must be none, minimal, low, medium, high, xhigh, or max."
+                            .into(),
+                    );
+                }
+                if thinking != "none"
+                    && (request.temperature.is_some_and(|value| value != 1.0)
+                        || request.top_p.is_some_and(|value| value != 1.0))
+                {
+                    return Err("OpenAI Thinking requires default sampling parameters (Temperature and Top-P unset or 1).".into());
+                }
+            }
+            "anthropic" => {
+                let budget = thinking.parse::<u64>().map_err(|_| {
+                    "Anthropic Thinking must be a token budget of at least 1024.".to_string()
+                })?;
+                if !(1024..=MAX_THINKING_TOKENS).contains(&budget) {
+                    return Err(format!(
+                        "Anthropic Thinking must be between 1024 and {MAX_THINKING_TOKENS} tokens."
+                    ));
+                }
+                if request.temperature.is_some_and(|value| value != 1.0)
+                    || request.top_p.is_some_and(|value| value < 0.95)
+                    || request.top_k.is_some()
+                {
+                    return Err("Anthropic Thinking requires Temperature unset or 1, Top-P unset or at least 0.95, and Top-K unset.".into());
+                }
+            }
+            "google" => {
+                let uses_budget = request.model.starts_with("gemini-2.5-");
+                let uses_level = request.model.starts_with("gemini-3");
+                if uses_budget {
+                    let budget = thinking.parse::<i64>().map_err(|_| {
+                        "Gemini 2.5 Thinking must be a token budget or -1 for dynamic thinking."
+                            .to_string()
+                    })?;
+                    if budget < -1 || budget > MAX_THINKING_TOKENS as i64 {
+                        return Err(format!(
+                            "Gemini 2.5 Thinking must be -1 or between 0 and {MAX_THINKING_TOKENS} tokens."
+                        ));
+                    }
+                } else if uses_level {
+                    if !matches!(thinking, "minimal" | "low" | "medium" | "high") {
+                        return Err(
+                            "Gemini 3 Thinking must be minimal, low, medium, or high.".into()
+                        );
+                    }
+                } else if let Ok(budget) = thinking.parse::<i64>() {
+                    if budget < -1 || budget > MAX_THINKING_TOKENS as i64 {
+                        return Err(format!(
+                            "Google Thinking must be -1 or between 0 and {MAX_THINKING_TOKENS} tokens."
+                        ));
+                    }
+                } else if !matches!(thinking, "minimal" | "low" | "medium" | "high") {
+                    return Err(
+                        "Google Thinking must be a token budget or minimal, low, medium, or high."
+                            .into(),
+                    );
+                }
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -160,7 +240,7 @@ fn status_error(status: StatusCode, message: Option<&str>) -> String {
     }
 }
 
-async fn openai(client: &Client, request: &ChatRequest) -> Result<ChatResponse, String> {
+fn openai_body(request: &ChatRequest) -> Map<String, Value> {
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({ "role": "system", "content": system }));
@@ -174,10 +254,27 @@ async fn openai(client: &Client, request: &ChatRequest) -> Result<ChatResponse, 
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
     body.insert("messages".into(), json!(messages));
-    body.insert("max_completion_tokens".into(), json!(MAX_OUTPUT_TOKENS));
+    let thinking = request.thinking.as_deref().map(str::trim);
+    let reasoning_enabled = thinking.is_some_and(|value| value != "none");
+    let max_tokens = if reasoning_enabled {
+        MAX_OUTPUT_TOKENS + MAX_THINKING_TOKENS
+    } else {
+        MAX_OUTPUT_TOKENS
+    };
+    body.insert("max_completion_tokens".into(), json!(max_tokens));
     body.insert("store".into(), json!(false));
-    insert_optional(&mut body, "temperature", request.temperature);
-    insert_optional(&mut body, "top_p", request.top_p);
+    if !reasoning_enabled {
+        insert_optional(&mut body, "temperature", request.temperature);
+        insert_optional(&mut body, "top_p", request.top_p);
+    }
+    if let Some(thinking) = thinking {
+        body.insert("reasoning_effort".into(), json!(thinking));
+    }
+    body
+}
+
+async fn openai(client: &Client, request: &ChatRequest) -> Result<ChatResponse, String> {
+    let body = openai_body(request);
     let value = send_json(
         client
             .post("https://api.openai.com/v1/chat/completions")
@@ -194,7 +291,17 @@ async fn openai(client: &Client, request: &ChatRequest) -> Result<ChatResponse, 
                 .and_then(Value::as_str)
         })
         .filter(|content| !content.is_empty())
-        .ok_or_else(|| "OpenAI returned no visible text.".to_string())?;
+        .ok_or_else(|| {
+            if value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                == Some("length")
+            {
+                "OpenAI used the completion token allowance without producing visible text. Lower Thinking or shorten the conversation.".to_string()
+            } else {
+                "OpenAI returned no visible text.".to_string()
+            }
+        })?;
     Ok(ChatResponse {
         content: content.into(),
         input_tokens: value
@@ -211,7 +318,7 @@ async fn openai(client: &Client, request: &ChatRequest) -> Result<ChatResponse, 
     })
 }
 
-async fn anthropic(client: &Client, request: &ChatRequest) -> Result<ChatResponse, String> {
+fn anthropic_body(request: &ChatRequest) -> Map<String, Value> {
     let messages: Vec<Value> = request
         .messages
         .iter()
@@ -220,15 +327,36 @@ async fn anthropic(client: &Client, request: &ChatRequest) -> Result<ChatRespons
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
     body.insert("messages".into(), json!(messages));
-    body.insert("max_tokens".into(), json!(MAX_OUTPUT_TOKENS));
+    let thinking_budget = request
+        .thinking
+        .as_deref()
+        .map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok());
+    body.insert(
+        "max_tokens".into(),
+        json!(MAX_OUTPUT_TOKENS + thinking_budget.unwrap_or(0)),
+    );
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         body.insert("system".into(), json!(system));
     }
-    insert_optional(&mut body, "temperature", request.temperature);
+    if thinking_budget.is_none() {
+        insert_optional(&mut body, "temperature", request.temperature);
+    }
     insert_optional(&mut body, "top_p", request.top_p);
     if let Some(top_k) = request.top_k.filter(|value| *value > 0) {
         body.insert("top_k".into(), json!(top_k));
     }
+    if let Some(budget) = thinking_budget {
+        body.insert(
+            "thinking".into(),
+            json!({ "type": "enabled", "budget_tokens": budget }),
+        );
+    }
+    body
+}
+
+async fn anthropic(client: &Client, request: &ChatRequest) -> Result<ChatResponse, String> {
+    let body = anthropic_body(request);
     let value = send_json(
         client
             .post("https://api.anthropic.com/v1/messages")
@@ -261,7 +389,7 @@ async fn anthropic(client: &Client, request: &ChatRequest) -> Result<ChatRespons
     })
 }
 
-async fn google(client: &Client, request: &ChatRequest) -> Result<ChatResponse, String> {
+fn google_body(request: &ChatRequest) -> Map<String, Value> {
     let contents: Vec<Value> = request
         .messages
         .iter()
@@ -275,12 +403,30 @@ async fn google(client: &Client, request: &ChatRequest) -> Result<ChatResponse, 
         })
         .collect();
     let mut generation = Map::new();
-    generation.insert("maxOutputTokens".into(), json!(MAX_OUTPUT_TOKENS));
     insert_optional(&mut generation, "temperature", request.temperature);
     insert_optional(&mut generation, "topP", request.top_p);
     if let Some(top_k) = request.top_k.filter(|value| *value > 0) {
         generation.insert("topK".into(), json!(top_k));
     }
+    let mut max_tokens = MAX_OUTPUT_TOKENS;
+    if let Some(thinking) = request.thinking.as_deref().map(str::trim) {
+        let uses_budget = request.model.starts_with("gemini-2.5-")
+            || (!request.model.starts_with("gemini-3") && thinking.parse::<i64>().is_ok());
+        let config = if uses_budget {
+            let budget = thinking.parse::<i64>().unwrap_or(-1);
+            if budget == -1 {
+                max_tokens += MAX_THINKING_TOKENS;
+            } else if budget > 0 {
+                max_tokens += budget as u64;
+            }
+            json!({ "thinkingBudget": budget })
+        } else {
+            max_tokens += MAX_THINKING_TOKENS;
+            json!({ "thinkingLevel": thinking })
+        };
+        generation.insert("thinkingConfig".into(), config);
+    }
+    generation.insert("maxOutputTokens".into(), json!(max_tokens));
     let mut body = Map::new();
     body.insert("contents".into(), json!(contents));
     body.insert("generationConfig".into(), Value::Object(generation));
@@ -290,6 +436,11 @@ async fn google(client: &Client, request: &ChatRequest) -> Result<ChatResponse, 
             json!({ "parts": [{ "text": system }] }),
         );
     }
+    body
+}
+
+async fn google(client: &Client, request: &ChatRequest) -> Result<ChatResponse, String> {
+    let body = google_body(request);
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
         request.model
@@ -320,6 +471,9 @@ async fn google(client: &Client, request: &ChatRequest) -> Result<ChatResponse, 
             .pointer("/candidates/0/finishReason")
             .and_then(Value::as_str)
             .unwrap_or("unknown reason");
+        if reason == "MAX_TOKENS" {
+            return Err("Google used the output token allowance without producing visible text. Lower Thinking or shorten the conversation.".into());
+        }
         return Err(format!("Google returned no visible text ({reason})."));
     }
     Ok(ChatResponse {
@@ -386,6 +540,7 @@ mod tests {
             temperature: None,
             top_p: None,
             top_k: None,
+            thinking: None,
         }
     }
 
@@ -416,5 +571,85 @@ mod tests {
         let mut invalid_model = request("google");
         invalid_model.model = "../model".into();
         assert!(validate(&invalid_model).is_err());
+    }
+
+    #[test]
+    fn validates_provider_specific_thinking_values() {
+        let mut openai = request("openai");
+        openai.thinking = Some("high".into());
+        openai.temperature = Some(1.0);
+        assert!(validate(&openai).is_ok());
+        openai.temperature = Some(0.7);
+        assert!(validate(&openai).is_err());
+        openai.temperature = None;
+        openai.thinking = Some("1024".into());
+        assert!(validate(&openai).is_err());
+
+        let mut anthropic = request("anthropic");
+        anthropic.thinking = Some("1024".into());
+        anthropic.temperature = Some(1.0);
+        assert!(validate(&anthropic).is_ok());
+        anthropic.top_p = Some(0.9);
+        assert!(validate(&anthropic).is_err());
+        anthropic.top_p = Some(0.95);
+        assert!(validate(&anthropic).is_ok());
+
+        let mut google = request("google");
+        google.model = "gemini-2.5-flash".into();
+        google.thinking = Some("-1".into());
+        assert!(validate(&google).is_ok());
+        google.thinking = Some("low".into());
+        assert!(validate(&google).is_err());
+        google.model = "gemini-3-flash".into();
+        assert!(validate(&google).is_ok());
+        google.thinking = Some("1024".into());
+        assert!(validate(&google).is_err());
+    }
+
+    #[test]
+    fn builds_provider_specific_thinking_bodies() {
+        let mut openai = request("openai");
+        openai.temperature = Some(1.0);
+        openai.top_p = Some(1.0);
+        openai.thinking = Some("high".into());
+        let body = Value::Object(openai_body(&openai));
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["max_completion_tokens"], 20480);
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+
+        openai.thinking = Some("none".into());
+        let body = Value::Object(openai_body(&openai));
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert_eq!(body["temperature"], 1.0);
+        assert_eq!(body["top_p"], 1.0);
+
+        let mut anthropic = request("anthropic");
+        anthropic.temperature = Some(1.0);
+        anthropic.thinking = Some("1024".into());
+        let body = Value::Object(anthropic_body(&anthropic));
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        assert_eq!(body["max_tokens"], 5120);
+        assert!(body.get("temperature").is_none());
+
+        let mut google = request("google");
+        google.model = "gemini-2.5-flash".into();
+        google.thinking = Some("1024".into());
+        let body = Value::Object(google_body(&google));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            1024
+        );
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 5120);
+
+        google.model = "gemini-3-flash".into();
+        google.thinking = Some("low".into());
+        let body = Value::Object(google_body(&google));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 20480);
     }
 }

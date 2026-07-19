@@ -315,6 +315,73 @@ body {
   gap: 6px;
 }
 
+.parameter-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.parameter-help {
+  position: relative;
+  display: inline-flex;
+}
+
+.parameter-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid #555;
+  border-radius: 50%;
+  color: #777;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+  text-transform: none;
+}
+
+.parameter-info:hover,
+.parameter-info:focus-visible {
+  border-color: #888;
+  color: #aaa;
+  outline: 1px solid #aaa;
+  outline-offset: 2px;
+}
+
+.parameter-tooltip {
+  position: absolute;
+  z-index: 10;
+  top: 20px;
+  left: 0;
+  display: none;
+  width: 240px;
+  padding: 8px 10px;
+  border: 1px solid #333;
+  border-radius: 6px;
+  background: #181818;
+  color: #bbb;
+  font-size: 0.72rem;
+  font-weight: 400;
+  line-height: 1.4;
+  letter-spacing: normal;
+  text-transform: none;
+  box-shadow: 0 4px 14px #0008;
+}
+
+.setting-group:last-child .parameter-tooltip {
+  right: 0;
+  left: auto;
+}
+
+.parameter-help:hover .parameter-tooltip,
+.parameter-help:focus-within .parameter-tooltip {
+  display: block;
+}
+
 label {
   font-size: 0.75rem;
   color: #555;

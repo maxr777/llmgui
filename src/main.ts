@@ -46,6 +46,7 @@ interface AppState {
   temperature: string;
   topP: string;
   topK: string;
+  thinking: string;
 }
 
 interface ChatResponse {
@@ -74,9 +75,10 @@ const defaultState: AppState = {
   ],
   conversations: [],
   activeConversationId: null,
-  temperature: "",
+  temperature: "1",
   topP: "",
   topK: "",
+  thinking: "",
 };
 
 let state = loadState();
@@ -419,6 +421,7 @@ async function sendMessage() {
         temperature: parseOptionalNumber(state.temperature),
         topP: parseOptionalNumber(state.topP),
         topK: parseOptionalNumber(state.topK),
+        thinking: state.thinking.trim() || undefined,
       },
     });
     const target = state.conversations.find((item) => item.id === conversationId);
@@ -487,10 +490,11 @@ function bindSettings() {
       saveState();
     });
   }
-  const fields: [string, keyof Pick<AppState, "temperature" | "topP" | "topK">][] = [
+  const fields: [string, keyof Pick<AppState, "temperature" | "topP" | "topK" | "thinking">][] = [
     ["#setting-temp", "temperature"],
     ["#setting-topp", "topP"],
     ["#setting-topk", "topK"],
+    ["#setting-thinking", "thinking"],
   ];
   for (const [selector, property] of fields) {
     const input = $(selector) as HTMLInputElement;

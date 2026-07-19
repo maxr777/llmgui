@@ -89,22 +89,46 @@
           
           <div class="setting-row param-row">
             <div class="setting-group">
-              <label>Temp</label>
-              <input type="number" id="setting-temp" step="0.1" min="0" max="2" placeholder="default">
+              <div class="parameter-label">
+                <label for="setting-temp">Temp</label>
+                <span class="parameter-help">
+                  <button type="button" class="parameter-info" aria-label="About Temperature" aria-describedby="help-temp">i</button>
+                  <span id="help-temp" class="parameter-tooltip" role="tooltip">Controls randomness. Lower values are more predictable; higher values are more varied. The provider default is 1.</span>
+                </span>
+              </div>
+              <input type="number" id="setting-temp" step="0.1" min="0" max="2" placeholder="default" aria-describedby="help-temp">
             </div>
             <div class="setting-group">
-              <label>Top-P</label>
-              <input type="number" id="setting-topp" step="0.1" min="0" max="1" placeholder="default">
+              <div class="parameter-label">
+                <label for="setting-topp">Top-P</label>
+                <span class="parameter-help">
+                  <button type="button" class="parameter-info" aria-label="About Top-P" aria-describedby="help-topp">i</button>
+                  <span id="help-topp" class="parameter-tooltip" role="tooltip">Limits generation to the most likely tokens whose probabilities add up to this value. Usually leave unset and adjust Temperature instead.</span>
+                </span>
+              </div>
+              <input type="number" id="setting-topp" step="0.1" min="0" max="1" placeholder="default" aria-describedby="help-topp">
             </div>
           </div>
           <div class="setting-row" style="margin-top: 16px;">
             <div class="setting-group">
-              <label>Top-K</label>
-              <input type="number" id="setting-topk" step="1" min="0" placeholder="default">
+              <div class="parameter-label">
+                <label for="setting-topk">Top-K</label>
+                <span class="parameter-help">
+                  <button type="button" class="parameter-info" aria-label="About Top-K" aria-describedby="help-topk">i</button>
+                  <span id="help-topk" class="parameter-tooltip" role="tooltip">Limits each generated token to the K most likely choices. Supported by Anthropic and Google; usually leave unset.</span>
+                </span>
+              </div>
+              <input type="number" id="setting-topk" step="1" min="0" placeholder="default" aria-describedby="help-topk">
             </div>
             <div class="setting-group">
-              <label>Thinking</label>
-              <input type="text" id="setting-thinking" placeholder="not supported yet" disabled>
+              <div class="parameter-label">
+                <label for="setting-thinking">Thinking</label>
+                <span class="parameter-help">
+                  <button type="button" class="parameter-info" aria-label="About Thinking" aria-describedby="help-thinking">i</button>
+                  <span id="help-thinking" class="parameter-tooltip" role="tooltip">Reasoning effort or budget. OpenAI: none, minimal, low, medium, high, xhigh, or max. Anthropic: 1024–16384 tokens. Gemini 2.5: token budget (-1 for dynamic); Gemini 3: minimal, low, medium, or high. Unsupported models are reported by the provider.</span>
+                </span>
+              </div>
+              <input type="text" id="setting-thinking" placeholder="provider default" aria-describedby="help-thinking">
             </div>
           </div>
         </div>

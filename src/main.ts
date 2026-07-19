@@ -108,7 +108,12 @@ function loadState(): AppState {
     if (!saved || saved.version !== 2 || !saved.models || !Array.isArray(saved.prompts) || !Array.isArray(saved.conversations)) {
       return structuredClone(defaultState);
     }
-    return { ...structuredClone(defaultState), ...saved, models: { ...defaultState.models, ...saved.models } };
+    return {
+      ...structuredClone(defaultState),
+      ...saved,
+      models: { ...defaultState.models, ...saved.models },
+      activeConversationId: null,
+    };
   } catch {
     return structuredClone(defaultState);
   }

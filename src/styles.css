@@ -396,7 +396,7 @@ body {
 .parameter-tooltip {
   position: absolute;
   z-index: 10;
-  top: 20px;
+  bottom: 20px;
   left: 0;
   display: none;
   width: 240px;

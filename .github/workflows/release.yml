@@ -101,4 +101,4 @@ jobs:
             These installers are unsigned. Windows SmartScreen or macOS Gatekeeper may display a warning.
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          args: ${{ matrix.args }} --ignore-version-mismatches

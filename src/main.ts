@@ -10,9 +10,20 @@ import { marked } from "marked";
 type Provider = "openai" | "anthropic" | "google";
 type Role = "user" | "assistant";
 
+const MAX_TEXT_ATTACHMENT_BYTES = 2 * 1024 * 1024;
+const MAX_REQUEST_TEXT_BYTES = 4 * 1024 * 1024;
+const MAX_MEDIA_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_TOTAL_BYTES = 20 * 1024 * 1024;
+const MAX_ANTHROPIC_IMAGE_BASE64_BYTES = 10_000_000;
+const MAX_ATTACHMENTS = 20;
+const MEDIA_TYPES = new Set(["application/pdf", "image/jpeg", "image/png", "image/webp"]);
+
 interface Attachment {
   name: string;
-  content: string;
+  content?: string;
+  mediaType?: string;
+  data?: string;
+  size?: number;
 }
 
 interface Message {
@@ -135,7 +146,8 @@ function loadState(): AppState {
 
 function saveState(): boolean {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    // Keep large binary payloads in memory for follow-up turns without exhausting localStorage.
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state, (key, value) => key === "data" ? undefined : value));
     return true;
   } catch {
     showError("Could not save locally. The app's storage may be full.");
@@ -147,12 +159,45 @@ function activeConversation(): Conversation | undefined {
   return state.conversations.find((conversation) => conversation.id === state.activeConversationId);
 }
 
-function apiContent(message: Message): string {
-  if (!message.attachments?.length) return message.content;
-  const files = message.attachments.map((file) =>
-    `\n\n<attachment name="${file.name.replace(/"/g, "&quot;")}">\n${file.content}\n</attachment>`,
-  ).join("");
-  return message.content + files;
+function apiAttachments(message: Message) {
+  return message.attachments?.map((file) => {
+    const name = attachmentName(file.name);
+    if (file.content !== undefined) return { kind: "text", name, content: file.content };
+    if (file.data && file.mediaType) {
+      return { kind: "media", name, mediaType: file.mediaType, data: file.data };
+    }
+    return { kind: "text", name, content: "[binary unavailable after app restart]" };
+  });
+}
+
+function attachmentName(name: string): string {
+  let safe = name.replace(/[\u0000-\u001f\u007f-\u009f/\\]/g, "_");
+  while (new TextEncoder().encode(safe).length > 255) safe = Array.from(safe).slice(0, -1).join("");
+  return safe || "attachment";
+}
+
+function requestTextBytes(messages: Message[], system?: string): number {
+  let text = system || "";
+  for (const message of messages) {
+    text += message.content;
+    for (const file of message.attachments || []) {
+      if (file.content !== undefined) {
+        text += `\n\n<attachment name="${attachmentName(file.name).replace(/"/g, "&quot;")}">\n${file.content}\n</attachment>`;
+      } else if (!file.data) {
+        text += `\n\n<attachment name="${attachmentName(file.name).replace(/"/g, "&quot;")}">\n[binary unavailable after app restart]\n</attachment>`;
+      }
+    }
+  }
+  return new TextEncoder().encode(text).length;
+}
+
+function detectedMediaType(header: Uint8Array): string | undefined {
+  if (header.length >= 5 && new TextDecoder().decode(header.slice(0, 5)) === "%PDF-") return "application/pdf";
+  if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return "image/jpeg";
+  if ([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((byte, index) => header[index] === byte)) return "image/png";
+  const ascii = new TextDecoder().decode(header);
+  if (ascii.startsWith("GIF87a") || ascii.startsWith("GIF89a")) return "image/gif";
+  if (ascii.startsWith("RIFF") && ascii.slice(8, 12) === "WEBP") return "image/webp";
 }
 
 function parseOptionalNumber(value: string): number | undefined {
@@ -522,7 +567,7 @@ async function saveVisibleApiKeys(): Promise<boolean> {
 async function sendMessage() {
   const input = $("#chat-input") as HTMLTextAreaElement;
   const text = input.value.trim();
-  if (!text || !state.selectedModel) return;
+  if ((!text && !pendingAttachments.length) || !state.selectedModel) return;
   const provider = state.selectedProvider;
   const model = state.selectedModel;
   await apiKeysLoaded;
@@ -553,7 +598,7 @@ async function sendMessage() {
   if (!conversation) {
     conversation = {
       id: crypto.randomUUID(),
-      title: text.replace(/\s+/g, " ").slice(0, 55),
+      title: (text || pendingAttachments.map((file) => file.name).join(", ")).replace(/\s+/g, " ").slice(0, 55),
       starred: false,
       updatedAt: Date.now(),
       messages: [],
@@ -568,11 +613,20 @@ async function sendMessage() {
     content: text,
     attachments: pendingAttachments.length ? pendingAttachments : undefined,
   };
+  const system = state.prompts.find((prompt) => prompt.id === state.selectedPromptId)?.content;
+  const requestMessages = [...conversation.messages, userMessage];
+  if (requestTextBytes(requestMessages, system) > MAX_REQUEST_TEXT_BYTES) {
+    showError("The conversation is too large to send (4 MiB text limit).");
+    return;
+  }
   conversation.messages.push(userMessage);
   conversation.updatedAt = Date.now();
   const conversationId = conversation.id;
-  const messages = conversation.messages.map((message) => ({ role: message.role, content: apiContent(message) }));
-  const system = state.prompts.find((prompt) => prompt.id === state.selectedPromptId)?.content;
+  const messages = conversation.messages.map((message) => ({
+    role: message.role,
+    content: message.content,
+    attachments: apiAttachments(message),
+  }));
   pendingConversations.add(conversationId);
   pendingAttachments = [];
   input.value = "";
@@ -633,20 +687,122 @@ function renderPendingAttachments() {
 
 async function addAttachments(files: FileList | null) {
   if (!files) return;
-  let aggregate = pendingAttachments.reduce((total, file) => total + new TextEncoder().encode(file.content).length, 0);
+  let attachmentCount = (activeConversation()?.messages.reduce(
+    (total, message) => total + (message.attachments?.length || 0),
+    0,
+  ) || 0) + pendingAttachments.length;
+  let mediaBytes = activeConversation()?.messages.reduce(
+    (total, message) => total + (message.attachments || []).reduce(
+      (messageTotal, attachment) => messageTotal + (attachment.data ? attachment.size || 0 : 0),
+      0,
+    ),
+    0,
+  ) || 0;
+  mediaBytes += pendingAttachments.reduce((total, file) => total + (file.data ? file.size || 0 : 0), 0);
   for (const file of Array.from(files)) {
-    if (file.size > 256 * 1024) {
-      showError(`${file.name} is larger than the 256 KiB attachment limit.`);
+    if (attachmentCount >= MAX_ATTACHMENTS) {
+      showError(`A request can contain at most ${MAX_ATTACHMENTS} attachments.`);
+      break;
+    }
+    let name = attachmentName(file.name);
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    if (extension === "epub") {
+      showError(`${file.name} is not yet supported safely. Convert it to PDF or UTF-8 text first.`);
       continue;
     }
-    const content = await file.text();
+    let header: Uint8Array;
+    try {
+      header = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+    } catch {
+      showError(`${file.name} could not be read.`);
+      continue;
+    }
+    let mediaType = detectedMediaType(header);
+    if (mediaType) {
+      if (file.size > MAX_MEDIA_ATTACHMENT_BYTES) {
+        showError(`${file.name} exceeds the 10 MiB media file limit.`);
+        continue;
+      }
+      let media: Blob = file;
+      if (mediaType === "image/gif") {
+        const width = header[6] | (header[7] << 8);
+        const height = header[8] | (header[9] << 8);
+        if (!width || !height || width * height > 16_000_000) {
+          showError(`${file.name} has unsupported image dimensions.`);
+          continue;
+        }
+        try {
+          const image = await createImageBitmap(file);
+          try {
+            if (image.width * image.height > 16_000_000) throw new Error("image too large");
+            const canvas = document.createElement("canvas");
+            canvas.width = image.width;
+            canvas.height = image.height;
+            const context = canvas.getContext("2d");
+            if (!context) throw new Error("canvas unavailable");
+            context.drawImage(image, 0, 0);
+            media = await new Promise<Blob>((resolve, reject) =>
+              canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("conversion failed")), "image/png"),
+            );
+          } finally {
+            image.close();
+          }
+          mediaType = "image/png";
+          name = attachmentName(name.replace(/\.gif$/i, "") + ".png");
+        } catch {
+          showError(`${file.name} could not be converted to a supported image.`);
+          continue;
+        }
+      }
+      if (!MEDIA_TYPES.has(mediaType) || media.size > MAX_MEDIA_ATTACHMENT_BYTES) {
+        showError(`${file.name} exceeds the 10 MiB media file limit after conversion.`);
+        continue;
+      }
+      if (mediaBytes + media.size > MAX_ATTACHMENT_TOTAL_BYTES) {
+        showError(`${file.name} exceeds the 20 MiB media limit for this request.`);
+        continue;
+      }
+      let dataUrl: string;
+      try {
+        dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(media);
+        });
+      } catch {
+        showError(`${file.name} could not be read.`);
+        continue;
+      }
+      const data = dataUrl.split(",", 2)[1];
+      if (state.selectedProvider === "anthropic" && mediaType.startsWith("image/") && data.length > MAX_ANTHROPIC_IMAGE_BASE64_BYTES) {
+        showError(`${file.name} exceeds Anthropic's encoded 10 MB image limit.`);
+        continue;
+      }
+      pendingAttachments.push({ name, mediaType, data, size: media.size });
+      attachmentCount += 1;
+      mediaBytes += media.size;
+      continue;
+    }
+
+    let content: string;
+    if (file.size > MAX_TEXT_ATTACHMENT_BYTES) {
+      showError(`${file.name} exceeds the 2 MiB text file limit.`);
+      continue;
+    }
+    try {
+      content = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
+    } catch {
+      showError(`${file.name} is not a supported UTF-8 text file.`);
+      continue;
+    }
     const bytes = new TextEncoder().encode(content).length;
-    if (content.includes("\0") || aggregate + bytes > 512 * 1024) {
-      showError(`${file.name} is not a text file or exceeds the 512 KiB total limit.`);
+    if (!content || content.includes("\0") || bytes > MAX_TEXT_ATTACHMENT_BYTES) {
+      showError(`${file.name} is not a supported UTF-8 text file or exceeds the 2 MiB text limit.`);
       continue;
     }
-    pendingAttachments.push({ name: file.name.slice(0, 255), content });
-    aggregate += bytes;
+    pendingAttachments.push({ name, content, size: file.size });
+    attachmentCount += 1;
   }
   renderPendingAttachments();
 }

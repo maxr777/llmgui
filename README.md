@@ -9,8 +9,10 @@ Built entirely with LLMs as an experiment in LLM-assisted development.
 - Multi-turn chat with OpenAI, Anthropic, and Google models
 - Persistent conversation history, stars, renaming, model settings, and reusable system prompts
 - Markdown, syntax highlighting, and LaTeX rendering
-- Text and code attachments (256 KiB per file, 512 KiB per message)
+- Text, code, image (JPEG, PNG, GIF, WebP), and PDF attachments (up to 10 MiB per media file and 20 MiB per request, subject to lower provider limits)
 - Provider-reported token usage and actionable API errors
+
+Binary attachment data is retained for follow-up turns during the current app session only. After a restart, attachment names remain in conversation history, but the original files must be attached again when their contents are needed.
 
 API keys are stored in the operating system credential store and are read only by the native Rust process when contacting the selected provider. They are never returned to the WebView or written to local storage or conversation history. Conversations and non-secret settings are stored locally in the app's WebView profile.
 
